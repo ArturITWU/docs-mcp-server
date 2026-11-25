@@ -1,0 +1,94 @@
+# Builds the ITWU image: the latest upstream main with this fork's own changes
+# (the `itwu` branch) merged on top, published to ghcr.io/<owner>/docs-mcp-server.
+#
+# The merge happens only inside the run and is never pushed, so the `itwu`
+# branch keeps just our own commits. A scheduled run skips the build when
+# neither upstream main nor `itwu` has changed since the last published image.
+# If upstream changes conflict with ours, the run fails and the last image stays.
+name: ITWU image
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+  push:
+    branches: [itwu]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: itwu-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout itwu
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: itwu
+          fetch-depth: 0
+
+      - name: Merge upstream main
+        id: sync
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/arabold/docs-mcp-server.git
+          git fetch --no-tags upstream main
+          own_sha=$(git rev-parse HEAD)
+          upstream_sha=$(git rev-parse upstream/main)
+          if ! git merge --no-edit upstream/main; then
+            echo "::error::Upstream main conflicts with the itwu branch. Merge it by hand: git fetch upstream && git merge upstream/main"
+            exit 1
+          fi
+          echo "key=${upstream_sha}-${own_sha}" >> "$GITHUB_OUTPUT"
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/docs-mcp-server" >> "$GITHUB_OUTPUT"
+
+      - name: Check last published build
+        id: check
+        env:
+          IMAGE: ${{ steps.sync.outputs.image }}
+          KEY: ${{ steps.sync.outputs.key }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          last=$(skopeo inspect --creds "${{ github.actor }}:${GH_TOKEN}" "docker://${IMAGE}:latest" 2>/dev/null \
+            | jq -r '.Labels["de.itwu.build-key"] // empty' || true)
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$last" = "$KEY" ]; then
+            echo "Nothing changed since the last image (${KEY}); skipping the build."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.build == 'true'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GitHub Container Registry
+        if: steps.check.outputs.build == 'true'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        if: steps.check.outputs.build == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ steps.sync.outputs.image }}:latest
+            ${{ steps.sync.outputs.image }}:${{ steps.sync.outputs.version }}-itwu
+          labels: |
+            de.itwu.build-key=${{ steps.sync.outputs.key }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha,scope=itwu
+          cache-to: type=gha,mode=max,scope=itwu
